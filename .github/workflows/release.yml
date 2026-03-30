@@ -1,11 +1,9 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version'
-        required: true
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -69,17 +67,9 @@ jobs:
         with:
           merge-multiple: true
 
-      - uses: actions/checkout@v4
-
-      - name: Create tag
-        run: |
-          git tag ${{ github.event.inputs.version }}
-          git push origin ${{ github.event.inputs.version }}
-
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version }}
           files: seek-*.tar.gz
           generate_release_notes: true
 
