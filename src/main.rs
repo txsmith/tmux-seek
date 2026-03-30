@@ -64,11 +64,11 @@ fn prepare_seek(config: &Config, capture: &str) -> SeekResult {
         .iter()
         .map(|m| {
             format!(
-                "{:<width$}\t({})\t{}",
+                "{:<width$}  ({})\t{}",
                 m.name,
                 m.count,
                 m.regex,
-                width = max_name_len
+                width = max_name_len,
             )
         })
         .collect();
@@ -133,20 +133,19 @@ fn capture_scrollback() -> Result<String, Box<dyn std::error::Error>> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-fn run_fzf(fzf_input: &str, tmpfile: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let preview_cmd = format!(
-        "grep -n -E \"$(echo {{}} | cut -f3)\" {} | head -50",
-        tmpfile
-    );
-
+fn run_fzf(fzf_input: &str) -> Result<String, Box<dyn std::error::Error>> {
     let mut child = Command::new("fzf")
         .args([
             "--delimiter=\t",
-            "--with-nth=1,2",
-            &format!("--preview={}", preview_cmd),
-            "--preview-window=right:50%",
-            "--header=tmux-seek: select a pattern",
+            "--with-nth=1",
+            "--nth=1",
+            "--no-preview",
+            "--no-scrollbar",
+            "--no-separator",
+            "--padding=0",
+            "--margin=0",
             "--no-multi",
+            "--no-info",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -170,25 +169,7 @@ fn parse_fzf_selection(output: &str) -> Option<&str> {
     if trimmed.is_empty() {
         return None;
     }
-    trimmed.split('\t').nth(2)
-}
-
-struct TempFile {
-    path: String,
-}
-
-impl TempFile {
-    fn create(capture: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let path = format!("/tmp/seek-capture-{}.txt", std::process::id());
-        std::fs::write(&path, capture)?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        std::fs::remove_file(&self.path).ok();
-    }
+    trimmed.split('\t').nth(1)
 }
 
 fn is_in_copy_mode() -> bool {
@@ -233,9 +214,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
-    let tmpfile = TempFile::create(&capture)?;
     let fzf_input = result.fzf_lines.join("\n");
-    let selected = run_fzf(&fzf_input, &tmpfile.path)?;
+    let selected = run_fzf(&fzf_input)?;
 
     if let Some(regex) = parse_fzf_selection(&selected) {
         if is_in_copy_mode() {
@@ -393,8 +373,8 @@ Cargo.toml  src";
 
     #[test]
     fn parse_fzf_selection_extracts_regex() {
-        let line = "URLs          \t(12)\thttps?://[^\\s]+";
-        assert_eq!(parse_fzf_selection(line), Some("https?://[^\\s]+"));
+        let line = "URLs           (12)\thttps?://[^[:space:]]+";
+        assert_eq!(parse_fzf_selection(line), Some("https?://[^[:space:]]+"));
     }
 
     #[test]
