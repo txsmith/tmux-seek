@@ -3,8 +3,6 @@ use serde::Deserialize;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-// --- Data Model ---
-
 #[derive(Debug, Deserialize)]
 struct Pattern {
     name: String,
@@ -16,16 +14,75 @@ struct Config {
     patterns: Vec<Pattern>,
 }
 
-struct PatternResult<'a> {
-    pattern: &'a Pattern,
+struct MatchedPattern {
+    name: String,
+    regex: String,
     count: usize,
     matching_lines: Vec<(usize, String)>,
 }
 
-// --- Config Loading ---
+struct SeekResult {
+    fzf_lines: Vec<String>,
+    matches: Vec<MatchedPattern>,
+}
+
+fn prepare_seek(config: &Config, capture: &str) -> SeekResult {
+    let compiled: Vec<(&Pattern, Regex)> = config
+        .patterns
+        .iter()
+        .filter_map(|p| {
+            Regex::new(&p.regex)
+                .map(|r| (p, r))
+                .map_err(|e| eprintln!("seek: invalid regex for '{}': {}", p.name, e))
+                .ok()
+        })
+        .collect();
+
+    let mut matches: Vec<MatchedPattern> = compiled
+        .iter()
+        .map(|(p, _)| MatchedPattern {
+            name: p.name.clone(),
+            regex: p.regex.clone(),
+            count: 0,
+            matching_lines: vec![],
+        })
+        .collect();
+
+    for (line_num, line) in capture.lines().enumerate() {
+        for (i, (_, regex)) in compiled.iter().enumerate() {
+            if regex.is_match(line) {
+                matches[i].count += 1;
+                matches[i].matching_lines.push((line_num, line.to_string()));
+            }
+        }
+    }
+
+    matches.retain(|m| m.count > 0);
+
+    let max_name_len = matches.iter().map(|m| m.name.len()).max().unwrap_or(0);
+    let fzf_lines: Vec<String> = matches
+        .iter()
+        .map(|m| {
+            format!(
+                "{:<width$}\t({})\t{}",
+                m.name,
+                m.count,
+                m.regex,
+                width = max_name_len
+            )
+        })
+        .collect();
+
+    SeekResult { fzf_lines, matches }
+}
+
+#[cfg(test)]
+fn resolve_seek(result: &SeekResult, selection: usize) -> Option<&str> {
+    result.matches.get(selection).map(|m| m.regex.as_str())
+}
 
 fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
-    let path = std::env::var("EXCAVATOR_PATTERNS")
+    let path = std::env::var("TMUX_SEEK_PATTERNS")
         .map(std::path::PathBuf::from)
         .ok()
         .filter(|p| p.exists())
@@ -42,30 +99,31 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
             exe.parent().unwrap().parent().unwrap().join("patterns.yaml")
         });
 
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("seek: cannot read {}: {}", path.display(), e))?;
+    if !path.exists() {
+        let plugin_dir = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().and_then(|p| p.parent()).map(|p| p.display().to_string()))
+            .unwrap_or_else(|| "<plugin dir>".to_string());
+        eprintln!("seek: patterns file not found. Place it at one of:");
+        eprintln!("  1. $TMUX_SEEK_PATTERNS (env var)");
+        eprintln!("  2. ~/.config/tmux-seek/patterns.yaml");
+        eprintln!("  3. {}/patterns.yaml (next to binary)", plugin_dir);
+        std::process::exit(1);
+    }
+    let contents = std::fs::read_to_string(&path)?;
     let config: Config = serde_yaml::from_str(&contents)?;
     Ok(config)
 }
 
-// --- Scrollback Capture ---
-
-fn get_history_limit() -> Result<usize, Box<dyn std::error::Error>> {
-    let output = Command::new("tmux")
-        .args(["show-options", "-gv", "history-limit"])
-        .output()?;
-    Ok(String::from_utf8(output.stdout)?.trim().parse()?)
+#[cfg(test)]
+fn load_config_from_str(yaml: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    let config: Config = serde_yaml::from_str(yaml)?;
+    Ok(config)
 }
 
-fn capture_scrollback(limit: usize) -> Result<String, Box<dyn std::error::Error>> {
+fn capture_scrollback() -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("tmux")
-        .args([
-            "capture-pane",
-            "-p",
-            "-J",
-            "-S",
-            &format!("-{}", limit),
-        ])
+        .args(["capture-pane", "-p", "-J", "-S", "-"])
         .output()?;
 
     if !output.status.success() {
@@ -75,67 +133,7 @@ fn capture_scrollback(limit: usize) -> Result<String, Box<dyn std::error::Error>
     Ok(String::from_utf8(output.stdout)?)
 }
 
-// --- Pattern Matching ---
-
-fn match_patterns<'a>(capture: &str, patterns: &'a [Pattern]) -> Vec<PatternResult<'a>> {
-    let compiled: Vec<(&Pattern, Regex)> = patterns
-        .iter()
-        .filter_map(|p| {
-            Regex::new(&p.regex)
-                .map(|r| (p, r))
-                .map_err(|e| eprintln!("seek: invalid regex for '{}': {}", p.name, e))
-                .ok()
-        })
-        .collect();
-
-    let mut results: Vec<PatternResult> = compiled
-        .iter()
-        .map(|(p, _)| PatternResult {
-            pattern: p,
-            count: 0,
-            matching_lines: vec![],
-        })
-        .collect();
-
-    for (line_num, line) in capture.lines().enumerate() {
-        for (i, (_, regex)) in compiled.iter().enumerate() {
-            if regex.is_match(line) {
-                results[i].count += 1;
-                results[i].matching_lines.push((line_num, line.to_string()));
-            }
-        }
-    }
-
-    results.into_iter().filter(|r| r.count > 0).collect()
-}
-
-// --- fzf Integration ---
-
-fn build_fzf_input(results: &[PatternResult]) -> String {
-    let max_name_len = results.iter().map(|r| r.pattern.name.len()).max().unwrap_or(0);
-
-    results
-        .iter()
-        .map(|r| {
-            format!(
-                "{:<width$}\t({})\t{}",
-                r.pattern.name,
-                r.count,
-                r.pattern.regex,
-                width = max_name_len
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn write_tempfile(capture: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let path = format!("/tmp/seek-capture-{}.txt", std::process::id());
-    std::fs::write(&path, capture)?;
-    Ok(path)
-}
-
-fn run_fzf(input: &str, tmpfile: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn run_fzf(fzf_input: &str, tmpfile: &str) -> Result<String, Box<dyn std::error::Error>> {
     let preview_cmd = format!(
         "grep -n -E \"$(echo {{}} | cut -f3)\" {} | head -50",
         tmpfile
@@ -155,13 +153,13 @@ fn run_fzf(input: &str, tmpfile: &str) -> Result<String, Box<dyn std::error::Err
         .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
+        stdin.write_all(fzf_input.as_bytes())?;
     }
 
     let output = child.wait_with_output()?;
 
     if !output.status.success() {
-        return Ok(String::new()); // user cancelled
+        return Ok(String::new());
     }
 
     Ok(String::from_utf8(output.stdout)?)
@@ -175,7 +173,23 @@ fn parse_fzf_selection(output: &str) -> Option<&str> {
     trimmed.split('\t').nth(2)
 }
 
-// --- copy-mode Handoff ---
+struct TempFile {
+    path: String,
+}
+
+impl TempFile {
+    fn create(capture: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = format!("/tmp/seek-capture-{}.txt", std::process::id());
+        std::fs::write(&path, capture)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.path).ok();
+    }
+}
 
 fn is_in_copy_mode() -> bool {
     let Ok(output) = Command::new("tmux")
@@ -204,42 +218,25 @@ fn enter_copy_mode_with_pattern(regex: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-// --- Main ---
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Fail fast if not in tmux
     if std::env::var("TMUX").is_err() {
         eprintln!("seek: must be run inside a tmux session");
         std::process::exit(1);
     }
 
-    // 2. Load config
     let config = load_config()?;
+    let capture = capture_scrollback()?;
+    let result = prepare_seek(&config, &capture);
 
-    // 3. Capture scrollback
-    let limit = get_history_limit()?;
-    let capture = capture_scrollback(limit)?;
-
-    // 4. Match patterns
-    let results = match_patterns(&capture, &config.patterns);
-
-    // 5. Handle no matches
-    if results.is_empty() {
+    if result.matches.is_empty() {
         eprintln!("seek: no patterns matched scrollback");
         std::process::exit(0);
     }
 
-    // 6. Write capture to tempfile for preview
-    let tmpfile = write_tempfile(&capture)?;
+    let tmpfile = TempFile::create(&capture)?;
+    let fzf_input = result.fzf_lines.join("\n");
+    let selected = run_fzf(&fzf_input, &tmpfile.path)?;
 
-    // 7. Build fzf input and invoke
-    let fzf_input = build_fzf_input(&results);
-    let selected = run_fzf(&fzf_input, &tmpfile)?;
-
-    // 8. Cleanup tempfile
-    std::fs::remove_file(&tmpfile).ok();
-
-    // 9. Parse selection and hand off
     if let Some(regex) = parse_fzf_selection(&selected) {
         if is_in_copy_mode() {
             exit_copy_mode()?;
@@ -248,4 +245,161 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_CONFIG: &str = r#"
+patterns:
+  - name: URLs
+    regex: 'https?://[^[:space:]]+'
+  - name: "File:line"
+    regex: '[^[:space:]]+:[0-9]+:[0-9]+'
+  - name: Git hash
+    regex: '[0-9a-f]{7,40}'
+  - name: Rust error
+    regex: 'error\[E[0-9]+\]'
+  - name: IP address
+    regex: '[0-9]{1,3}(\.[0-9]{1,3}){3}'
+"#;
+
+    const SCROLLBACK_COMPILER_SESSION: &str = "\
+$ cargo build
+   Compiling seek v0.1.0 (/home/user/projects/tmux-seek)
+error[E0277]: the trait bound `Output: Default` is not satisfied
+   --> src/main.rs:42:10
+    |
+42  |         .unwrap_or_default();
+    |          ^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Output`
+For more information about this error, try `rustc --explain E0277`.
+$ git log --oneline
+a]1b2c3d4 fix: resolve trait bound error
+e5f6a7b8 feat: add scrollback capture
+$ echo done";
+
+    const SCROLLBACK_WEB_SESSION: &str = "\
+$ curl https://api.example.com/v1/users
+{\"id\": 1, \"name\": \"alice\"}
+$ ssh 192.168.1.50
+Last login: Mon Mar 29 10:00:00 2026
+$ cat /var/log/app.log
+2026-03-29 File \"/app/server.py\", line 42
+https://docs.python.org/3/library/exceptions.html";
+
+    const SCROLLBACK_EMPTY: &str = "\
+$ echo hello
+hello
+$ ls
+Cargo.toml  src";
+
+    // --- prepare_seek: inspect what fzf would show ---
+
+    #[test]
+    fn compiler_session_shows_expected_patterns() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let result = prepare_seek(&config, SCROLLBACK_COMPILER_SESSION);
+
+        let names: Vec<&str> = result.matches.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"Rust error"), "should find rust error codes");
+        assert!(names.contains(&"Git hash"), "should find git hashes");
+        assert!(names.contains(&"File:line"), "should find file:line references");
+    }
+
+    #[test]
+    fn compiler_session_counts_are_correct() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let result = prepare_seek(&config, SCROLLBACK_COMPILER_SESSION);
+
+        let rust_err = result.matches.iter().find(|m| m.name == "Rust error").unwrap();
+        assert_eq!(rust_err.count, 1, "error[E0277] appears on one line");
+    }
+
+    #[test]
+    fn web_session_shows_urls_and_ips() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let result = prepare_seek(&config, SCROLLBACK_WEB_SESSION);
+
+        let names: Vec<&str> = result.matches.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"URLs"));
+        assert!(names.contains(&"IP address"));
+    }
+
+    #[test]
+    fn empty_scrollback_produces_no_matches() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let result = prepare_seek(&config, SCROLLBACK_EMPTY);
+
+        assert!(result.matches.is_empty());
+        assert!(result.fzf_lines.is_empty());
+    }
+
+    #[test]
+    fn fzf_lines_contain_name_and_count() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let result = prepare_seek(&config, SCROLLBACK_WEB_SESSION);
+
+        for (line, m) in result.fzf_lines.iter().zip(result.matches.iter()) {
+            assert!(line.contains(&m.name), "fzf line should contain pattern name");
+            assert!(line.contains(&format!("({})", m.count)), "fzf line should contain count");
+        }
+    }
+
+    #[test]
+    fn selecting_rust_error_returns_its_regex() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let result = prepare_seek(&config, SCROLLBACK_COMPILER_SESSION);
+
+        let idx = result.matches.iter().position(|m| m.name == "Rust error").unwrap();
+        let regex = resolve_seek(&result, idx).unwrap();
+        assert_eq!(regex, r"error\[E[0-9]+\]");
+    }
+
+    #[test]
+    fn selecting_url_returns_url_regex() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let result = prepare_seek(&config, SCROLLBACK_WEB_SESSION);
+
+        let idx = result.matches.iter().position(|m| m.name == "URLs").unwrap();
+        let regex = resolve_seek(&result, idx).unwrap();
+        assert_eq!(regex, r"https?://[^[:space:]]+");
+    }
+
+    #[test]
+    fn selecting_out_of_bounds_returns_none() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let result = prepare_seek(&config, SCROLLBACK_COMPILER_SESSION);
+
+        assert!(resolve_seek(&result, 999).is_none());
+    }
+
+    // --- Config parsing ---
+
+    #[test]
+    fn config_parses_all_patterns() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        assert_eq!(config.patterns.len(), 5);
+        assert_eq!(config.patterns[0].name, "URLs");
+    }
+
+    #[test]
+    fn config_rejects_invalid_yaml() {
+        let result = load_config_from_str("not: [valid: yaml: ugh");
+        assert!(result.is_err());
+    }
+
+    // --- parse_fzf_selection ---
+
+    #[test]
+    fn parse_fzf_selection_extracts_regex() {
+        let line = "URLs          \t(12)\thttps?://[^\\s]+";
+        assert_eq!(parse_fzf_selection(line), Some("https?://[^\\s]+"));
+    }
+
+    #[test]
+    fn parse_fzf_selection_empty_is_none() {
+        assert_eq!(parse_fzf_selection(""), None);
+        assert_eq!(parse_fzf_selection("  \n  "), None);
+    }
 }
