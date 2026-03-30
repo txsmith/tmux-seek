@@ -20,7 +20,7 @@ Then `prefix + I` to install.
 git clone https://github.com/txsmith/tmux-seek.git ~/.tmux/plugins/tmux-seek
 cd ~/.tmux/plugins/tmux-seek
 cargo build --release
-mkdir -p bin && ln -sf ../target/release/seek bin/seek
+mkdir -p bin && ln -sf ../target/release/tmux-seek bin/tmux-seek
 ```
 
 Add to `tmux.conf`:

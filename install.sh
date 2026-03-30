@@ -38,7 +38,7 @@ echo "Installing seek ${VERSION}..."
 mkdir -p "$INSTALL_DIR/bin"
 echo "Downloading $ARTIFACT..."
 curl -sL "$DOWNLOAD_URL" | tar xz -C "$INSTALL_DIR/bin"
-chmod +x "$INSTALL_DIR/bin/seek"
+chmod +x "$INSTALL_DIR/bin/tmux-seek"
 
 # Copy default patterns if user doesn't have one
 CONFIG_DIR="${HOME}/.config/tmux-seek"

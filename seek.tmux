@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="$CURRENT_DIR/bin/seek"
+BINARY="$CURRENT_DIR/bin/tmux-seek"
 
 # Auto-install binary if missing
 if [ ! -x "$BINARY" ]; then
