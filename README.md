@@ -2,7 +2,11 @@
 
 Conveniently search your tmux scrollback with common patterns. Pick a pattern class (URLs, file paths, git hashes, etc.) via fzf, then land in copy-mode with that regex seeded — navigate matches with `n`/`N`.
 
-<!-- TODO: screencast -->
+
+https://github.com/user-attachments/assets/fe86d9c1-1e84-4426-add8-374682b695a9
+
+
+
 
 ## Install
 
